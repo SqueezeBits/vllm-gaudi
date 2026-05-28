@@ -303,9 +303,16 @@ def hpu_causal_conv1d_fn(
         with torch.no_grad():
             update_mask = (actual_qlens > 0).view(-1, 1, 1)
             new_states_t = new_states.transpose(-1, -2)  # [B, state_len, dim]
-            existing_states = conv_states.index_select(0, safe_cache_idx_prefill)[:, -state_len:, :]
-            conv_states[safe_cache_idx_prefill, -state_len:, :] = torch.where(update_mask, new_states_t,
-                                                                              existing_states)
+            existing_rows = conv_states.index_select(0, safe_cache_idx_prefill).clone()
+            existing_tail = existing_rows[:, -state_len:, :]
+            updated_tail = torch.where(update_mask, new_states_t, existing_tail)
+            # Avoid direct advanced-slice assignment into the graph input.
+            # In HPU lazy HPUGraph capture this lowers to hpu::slice_insert on
+            # a strided view of conv_states and can fail replay with detached
+            # storage.  Updating full selected rows through index_copy_ keeps
+            # the mutation explicit at the cache-row boundary.
+            existing_rows[:, -state_len:, :].copy_(updated_tail)
+            conv_states.index_copy_(0, safe_cache_idx_prefill.long(), existing_rows)
 
     else:
         # Fallback: variable-length sequences — per-sequence loop
@@ -343,7 +350,9 @@ def hpu_causal_conv1d_fn(
             seq_out[:, seq_start:seq_end] = out_b
 
             with torch.no_grad():
-                conv_states[cache_idx_b, -state_len:, :] = new_state_b.unsqueeze(0).transpose(-1, -2)
+                existing_row_b = conv_states.index_select(0, cache_idx_b.long()).clone()
+                existing_row_b[:, -state_len:, :].copy_(new_state_b.unsqueeze(0).transpose(-1, -2))
+                conv_states.index_copy_(0, cache_idx_b.long(), existing_row_b)
 
     seq_out = _apply_activation(seq_out, activation)
 
@@ -486,6 +495,8 @@ def hpu_causal_conv1d_fn_update(
     out = seq_out
 
     with torch.no_grad():
-        conv_states[safe_cache_idx, -state_len:, :] = new_state.transpose(-1, -2)
+        existing_rows = conv_states.index_select(0, safe_cache_idx.long()).clone()
+        existing_rows[:, -state_len:, :].copy_(new_state.transpose(-1, -2))
+        conv_states.index_copy_(0, safe_cache_idx.long(), existing_rows)
 
     return out.to(original_dtype)

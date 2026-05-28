@@ -850,12 +850,12 @@ def _disable_gdn_hpu_graph(vllm_config: VllmConfig) -> bool:
     Qwen3.6/Qwen3.5 GDN recurrent-state tensors currently fail HPU graph
     capture/replay in lazy mode with detached storage / empty tensor-data
     bridge errors.  Lazy execution itself is valid, so keep PT lazy mode but
-    bypass HPUGraphs for GDN layers by default.  Set
-    VLLM_GDN_DISABLE_HPUGRAPH=0 to force the old graph path for debugging.
+    preserve the explicit VLLM_GDN_DISABLE_HPUGRAPH fallback for debugging
+    or emergency production mitigation.
     """
     if not htorch.utils.internal.is_lazy():
         return False
-    if not _truthy_env("VLLM_GDN_DISABLE_HPUGRAPH", "1"):
+    if not _truthy_env("VLLM_GDN_DISABLE_HPUGRAPH", "0"):
         return False
     return _config_has_gdn_layers(vllm_config)
 
@@ -866,8 +866,8 @@ def _maybe_wrap_in_hpu_graph(*args, **kwargs):
     if htorch.utils.internal.is_lazy():
         if vllm_config is not None and _disable_gdn_hpu_graph(vllm_config):
             logger.warning_once(
-                "Disabling HPUGraph wrapping for GDN/linear_attention model in lazy mode; "
-                "set VLLM_GDN_DISABLE_HPUGRAPH=0 to force the old graph path.")
+                "Disabling HPUGraph wrapping for GDN/linear_attention model in lazy mode "
+                "because VLLM_GDN_DISABLE_HPUGRAPH is enabled.")
             return adapter
         return htorch.hpu.wrap_in_hpu_graph(adapter, disable_tensor_cache=True)
     return adapter
@@ -5153,6 +5153,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         with tqdm(total=num_candidates, desc=desc, unit="item") as pbar:
             for idx, (batch_size, seq_len, num_blocks) in enumerate(reversed(buckets)):
                 if seq_len > self.max_num_tokens:
+                    continue
+                if batch_size > self.max_num_seqs:
+                    logger.debug_once(
+                        "Skipping %s warmup bucket with batch_size=%d because max_num_seqs=%d",
+                        phase.lower(), batch_size, self.max_num_seqs)
                     continue
                 # Graph memory usage is proportional to seq dimension in a batch
                 if is_prompt:
