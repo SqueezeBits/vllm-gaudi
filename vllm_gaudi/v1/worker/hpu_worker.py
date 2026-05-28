@@ -491,7 +491,11 @@ class HPUWorker(WorkerBase):
                     mamba_state_per_block, ratio)
                 available = adjusted
 
-        return available
+        # Keep the scheduler/cache planner inputs integral.  The HPU memory
+        # estimates above are derived from utilization ratios and can otherwise
+        # stay as float, which later produces float num_blocks for hybrid
+        # UniformTypeKVCacheSpecs layouts (e.g. Gemma4).
+        return int(available)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks

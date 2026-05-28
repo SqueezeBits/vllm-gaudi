@@ -89,7 +89,13 @@ def get_features():
                 Not(ModelType('qwen2')))),
         Value('fused_block_softmax', False),
         Value('flex_impl', False, env_var='VLLM_PROMPT_USE_FLEX_ATTENTION'),
-        Value('fsdpa_impl', All(Kernel(fsdpa), Not(ModelType('mllama'))), env_var='VLLM_PROMPT_USE_FUSEDSDPA'),
+        # Gemma4 combines sliding-window and periodic full-attention layers
+        # with heterogeneous local/global head dimensions. The HPU Gemma4
+        # wrappers, head-size-512 paged-attention support, and KV-sharing prompt
+        # cache handling keep the FusedSDPA prompt path semantically aligned with
+        # the naive/HF baseline for validated short text prompts.
+        Value('fsdpa_impl', All(Kernel(fsdpa), Not(ModelType('mllama'))),
+              env_var='VLLM_PROMPT_USE_FUSEDSDPA'),
         Value('naive_impl', True),
         ValueFromList('prompt_attn_impl', supported_attn_impls),
         Value('skip_warmup', False),

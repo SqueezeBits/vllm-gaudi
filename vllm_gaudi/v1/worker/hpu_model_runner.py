@@ -5787,6 +5787,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         add_kv_sharing_layers_to_kv_cache_groups(
             self.shared_kv_cache_layers,
             kv_cache_config.kv_cache_groups,
+            self.runner_only_attn_layers,
         )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
@@ -5825,7 +5826,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                    # KV-sharing layers are appended to the target KV-cache group
+                    # for metadata assignment, but they do not own a separate
+                    # KVCacheSpec entry. Use the target layer spec for grouping.
+                    spec_layer_name = self.shared_kv_cache_layers.get(layer_name, layer_name)
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[spec_layer_name]
                 key = (full_cls_name, layer_kv_cache_spec)
                 attn_backends[key] = AttentionGroupKey(attn_backend, layer_kv_cache_spec)
                 attn_backend_layers[key].append(layer_name)
@@ -6213,11 +6218,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     for group in kv_cache_config.kv_cache_groups:
                         if layer_name in group.layer_names:
                             kv_cache_spec = group.kv_cache_spec
+                            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                                spec_layer_name = self.shared_kv_cache_layers.get(layer_name, layer_name)
+                                kv_cache_spec = kv_cache_spec.kv_cache_specs[spec_layer_name]
                             break
                     assert kv_cache_spec is not None, f"No spec found for {layer_name}"
-                    assert kv_cache_tensor.size % kv_cache_spec.page_size_bytes == 0
-                    num_blocks = \
-                        kv_cache_tensor.size // kv_cache_spec.page_size_bytes
+                    assert kv_cache_tensor.size % kv_cache_spec.page_size_bytes == 0, (
+                        layer_name, kv_cache_tensor.size, kv_cache_spec.page_size_bytes)
+                    num_blocks = int(
+                        kv_cache_tensor.size // kv_cache_spec.page_size_bytes)
                     # `num_blocks` is the number of blocks the model runner can use.
                     # `kv_cache_config.num_blocks` is the number of blocks that
                     # KVCacheManager may allocate.
@@ -6281,7 +6290,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logger.info("[KV sharing] Setting up tensor sharing for %s layers", len(self.shared_kv_cache_layers))
             for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
                 kv_caches[layer_name] = kv_caches[target_layer_name]
-        assert layer_names == set(kv_caches.keys()), "Some layers are not correctly initialized"
+        expected_kv_cache_layers = set(layer_names) | set(self.shared_kv_cache_layers)
+        assert expected_kv_cache_layers == set(kv_caches.keys()), (
+            "Some layers are not correctly initialized",
+            sorted(expected_kv_cache_layers - set(kv_caches.keys())),
+            sorted(set(kv_caches.keys()) - expected_kv_cache_layers),
+        )
         bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
 
         if self.enable_bucketing:

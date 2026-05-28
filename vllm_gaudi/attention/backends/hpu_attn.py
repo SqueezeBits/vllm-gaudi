@@ -562,6 +562,14 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                                            scales=v_scales,
                                            block_size=attn_metadata.block_size,
                                            is_prompt=attn_metadata.is_prompt)
+            elif attn_metadata.is_prompt and slot_mapping is not None:
+                # Gemma4/YOCO KV-sharing layers must attend to the full-length
+                # K/V tensors produced by the target non-shared layer, not to
+                # their own freshly-projected K/V. The HPU runner aliases the
+                # shared layer's kv_cache to its target layer cache; fetch the
+                # current prompt slots from that cache for prompt attention.
+                key = self.k_cache.fetch_from_cache(key_cache, slot_mapping, scales=k_scales)
+                value = self.v_cache.fetch_from_cache(value_cache, slot_mapping, scales=v_scales)
 
         if attn_metadata.is_prompt or seq_len > 1:
             # Prompt run.

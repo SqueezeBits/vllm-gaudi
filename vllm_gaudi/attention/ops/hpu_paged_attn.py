@@ -51,7 +51,10 @@ class HPUPagedAttention:
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        return list(range(1, 257))
+        # Experimental Gemma4 bring-up: allow full-attention global_head_dim=512.
+        # If lower-level HPU kernels cannot handle this, smoke tests will fail later
+        # and this should be replaced by a model-specific fallback.
+        return list(range(1, 257)) + [512]
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
