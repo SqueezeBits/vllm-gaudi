@@ -833,42 +833,9 @@ def _mark_unbacked_dim0(tensor: torch.Tensor):
     torch._dynamo.decorators.mark_unbacked(tensor, 0)
 
 
-def _truthy_env(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _config_has_gdn_layers(vllm_config: VllmConfig) -> bool:
-    model_config = vllm_config.model_config
-    parallel_config = vllm_config.parallel_config
-    gdn_types = ("gdn_attention", "linear_attention")
-    return any(model_config.get_num_layers_by_block_type(parallel_config, block_type) > 0 for block_type in gdn_types)
-
-
-def _disable_gdn_hpu_graph(vllm_config: VllmConfig) -> bool:
-    """Return whether GDN models should run lazy without HPUGraph wrapping.
-
-    Qwen3.6/Qwen3.5 GDN recurrent-state tensors currently fail HPU graph
-    capture/replay in lazy mode with detached storage / empty tensor-data
-    bridge errors.  Lazy execution itself is valid, so keep PT lazy mode but
-    preserve the explicit VLLM_GDN_DISABLE_HPUGRAPH fallback for debugging
-    or emergency production mitigation.
-    """
-    if not htorch.utils.internal.is_lazy():
-        return False
-    if not _truthy_env("VLLM_GDN_DISABLE_HPUGRAPH", "0"):
-        return False
-    return _config_has_gdn_layers(vllm_config)
-
-
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
-    vllm_config = kwargs.get("vllm_config")
     adapter = HpuModelAdapter(*args, **kwargs)
     if htorch.utils.internal.is_lazy():
-        if vllm_config is not None and _disable_gdn_hpu_graph(vllm_config):
-            logger.warning_once(
-                "Disabling HPUGraph wrapping for GDN/linear_attention model in lazy mode "
-                "because VLLM_GDN_DISABLE_HPUGRAPH is enabled.")
-            return adapter
         return htorch.hpu.wrap_in_hpu_graph(adapter, disable_tensor_cache=True)
     return adapter
 
@@ -1270,15 +1237,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.mem_margin = None
         self.use_merged_prefill = get_config().merged_prefill
 
-        self.disable_gdn_hpu_graph = _disable_gdn_hpu_graph(self.vllm_config) and self.num_gdn > 0
-        if self.disable_gdn_hpu_graph:
-            logger.warning(
-                "GDN lazy-mode HPUGraphs are disabled for this model; running with "
-                "PT lazy execution and bypass_hpu_graphs=True for correctness.")
-            if not self.skip_warmup:
-                logger.warning("Skipping warmup because GDN HPUGraphs are disabled in lazy mode.")
-                self.skip_warmup = True
-        self.use_hpu_graph = not self.model_config.enforce_eager and not self.disable_gdn_hpu_graph
+        self.use_hpu_graph = not self.model_config.enforce_eager
         self.max_batch_size = self.scheduler_config.max_num_seqs
         self.max_num_seqs = self.scheduler_config.max_num_seqs
         if prompt_profile_cfg:
@@ -4676,7 +4635,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         return torch.compile(module, **self.compile_config.get_compile_args())
 
     def _use_graphs(self, attn_metadata, batch_size):
-        if self.model_config.enforce_eager or getattr(self, "disable_gdn_hpu_graph", False):
+        if self.model_config.enforce_eager:
             return False
         # skip HPU graphs for long (query + context) prefills
         if attn_metadata is not None and attn_metadata.is_prompt:
